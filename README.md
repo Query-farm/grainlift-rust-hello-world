@@ -36,7 +36,8 @@ export GRAINLIFT_HELLO_TOKEN=local-development-token-change-me
 ./target/release/grainlift-rust-hello-world --port 8080 --report /tmp/synthetic-report.json
 ```
 
-The listener is always loopback-only and bearer authentication is mandatory.
+The listener is always loopback-only. HTTP requires bearer authentication;
+the optional TCP listener requires a verified and authorized client certificate.
 The first stdout line is a small JSON readiness message containing the endpoint
 and serving PID. It never contains the token. A stdin byte, stdin EOF, Ctrl-C,
 or SIGTERM requests shutdown. Keep stdin open when supervising the process.
@@ -45,9 +46,16 @@ SQL, values, credentials or raw downstream errors.
 
 Connect with `autocommit=True` and database options `grainlift.uri`,
 `grainlift.target=default`, and `grainlift.auth.bearer_token`. Run `QUERY` through
-the ordinary ADBC cursor. This example exposes HTTP only; the underlying
-Grainlift server also supports other transports, which this comparison does
-not exercise.
+the ordinary ADBC cursor.
+
+To select authenticated TCP, pass `--tls-dir /private/test-certificates`.
+The directory must contain `server.pem`, `server-key.pem`, and `ca.pem`.
+The server verifies client certificates against that CA and permits only
+`spiffe://benchmark.test/client` in trust domain `benchmark.test`. The client
+uses `grainlift.tls.ca`, `grainlift.tls.cert`, `grainlift.tls.key`, and
+`grainlift.tls.server_name=localhost` instead of a bearer token. The native
+URI is `tls+tcp://127.0.0.1:PORT`. The companion validation script creates
+one-day test certificates; never commit these files or use them in production.
 
 Dimensions are configurable using `--rows`, `--batch-rows`, and
 `--payload-bytes`. Limits match the Python worker: 1–1,000,000 rows, 1–4,096
@@ -56,6 +64,12 @@ rows per batch, 0–1,024 payload bytes, and
 32 statements and 32 results per session, a 2 MiB HTTP body, a 64 KiB command,
 and a ten-second idle lifetime. Server options cannot be overridden by callers.
 This is a local comparison application, not an Internet-facing deployment.
+The HTTP body limit is not a TCP framing limit. TCP retains VGI 0.27.1's
+existing IPC message guard (up to `u32::MAX` bytes), TLS handshake deadline,
+and shared Grainlift session/result limits. Its listener does not provide
+a configurable total accepted-connection ceiling. The diagnostic uses one
+trusted client and bounded synthetic inputs; this does not qualify the
+listener for hostile clients or public exposure.
 
 ## Matched single-client comparison
 
@@ -79,6 +93,14 @@ Python process isolation is measured separately. This compares complete service
 implementations, not isolated language execution: Rust retains Grainlift's
 session actor and Rust transport, while Python uses its SDK and Granian.
 All cases use one client, so no concurrency scaling claim follows from them.
+
+`validation/diagnostics/run_transports.sh` in Grainlift additionally compares
+Rust HTTP, Python/Granian HTTP, Rust TCP/mTLS, and Python TCP/mTLS with
+in-process backends and the same native driver. TCP results use a separate
+stream connection per query, including a TLS handshake; only initial session
+startup is excluded. See that harness's README for reproduction and transport
+limitations. HTTP bearer authentication and TCP certificate authentication
+remain enabled, so this compares complete paths rather than framing alone.
 
 The [2026-09-26 EC2 results](https://github.com/Query-farm/grainlift/blob/main/validation/load-results/ec2-matched-synthetic-20260926/README.md)
 average 9.39 ms/query for Rust, 17.72 ms for Python/Granian in-process, and

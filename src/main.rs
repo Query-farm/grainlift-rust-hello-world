@@ -6,18 +6,28 @@ use grainlift_rust_hello_world::{Counters, SyntheticBackend, Workload};
 use grainlift_server::config::TargetConfig;
 use grainlift_server::service::build_server_with_max_bind;
 use grainlift_server::session::{SessionLimits, SessionManager, TargetAuthorizer};
+use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use vgi_rpc::AuthContext;
 use vgi_rpc::auth::bearer::bearer_authenticate_static;
 use vgi_rpc::http::HttpState;
+use vgi_rpc::tcp::{
+    TcpIdentityOptions, TcpMutualTlsConfig, TcpMutualTlsOptions, serve_tcp_with_mtls_identity,
+};
 
 /// A loopback-only synthetic ADBC service. Authentication is always required.
 #[derive(Parser)]
 struct Args {
+    /// Certificate directory selects authenticated TCP instead of HTTP.
+    #[arg(long)]
+    tls_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     port: u16,
     #[arg(long, default_value_t = 4096)]
@@ -42,8 +52,8 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let workload = Workload::new(args.rows, args.batch_rows, args.payload_bytes)?;
-    let token = std::env::var("GRAINLIFT_HELLO_TOKEN")?;
-    if token.len() < 16 {
+    let token = std::env::var("GRAINLIFT_HELLO_TOKEN").unwrap_or_default();
+    if args.tls_dir.is_none() && token.len() < 16 {
         return Err("A bearer token of at least 16 bytes is required".into());
     }
     let counters = Arc::new(Counters::default());
@@ -72,7 +82,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_results_per_session: 32,
         },
         TargetAuthorizer::new(HashMap::from([(
-            "load-principal".into(),
+            if args.tls_dir.is_some() {
+                "peer/spiffe/spiffe%3A%2F%2Fbenchmark.test/spiffe%3A%2F%2Fbenchmark.test%2Fclient"
+                    .into()
+            } else {
+                "load-principal".into()
+            },
             vec!["default".into()],
         )])),
         Duration::from_secs(5),
@@ -82,18 +97,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "synthetic-rust".into(),
         64 * 1024 * 1024,
     ));
-    let state = HttpState::builder()
-        .server(rpc)
-        .authenticate(bearer_authenticate_static(HashMap::from([(
-            token,
-            AuthContext::for_principal("bearer", "load-principal"),
-        )])))
-        .max_body_size(2 * 1024 * 1024)
-        .max_request_bytes(2 * 1024 * 1024)
-        .request_timeout(Duration::from_secs(10))
-        .build();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await?;
-    let endpoint = format!("http://{}", listener.local_addr()?);
     let reaper_manager = manager.clone();
     let reaper = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -108,21 +111,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = io::stdin().lock().fill_buf();
         let _ = stop_tx.send(());
     });
-    println!(
-        "{}",
-        serde_json::json!({"endpoint": endpoint, "sample_pid": std::process::id(),
-        "transport": "authenticated loopback HTTP, native ADBC C ABI, Rust synthetic in-process backend"})
-    );
-    io::stdout().flush()?;
-    axum::serve(listener, vgi_rpc::http::build_router(state))
-        .with_graceful_shutdown(async {
-            tokio::select! {
-                _ = stop_rx => {},
-                _ = tokio::signal::ctrl_c() => {},
-                _ = terminate_signal() => {},
-            }
-        })
-        .await?;
+    let stop = async {
+        tokio::select! {
+            _ = stop_rx => {},
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate_signal() => {},
+        }
+    };
+    if let Some(directory) = &args.tls_dir {
+        let tls = load_tls(directory)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop_flag = shutdown.clone();
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let port = args.port;
+        let mut task = tokio::task::spawn_blocking(move || {
+            serve_tcp_with_mtls_identity(
+                rpc,
+                "127.0.0.1",
+                port,
+                None,
+                stop_flag,
+                TcpMutualTlsOptions::new(tls).with_identity(TcpIdentityOptions {
+                    policy: Some(vgi_rpc::peer_identity_primary("spiffe")),
+                    ..TcpIdentityOptions::default()
+                }),
+                move |host, port| {
+                    let _ = bound_tx.send(format!("tls+tcp://{host}:{port}"));
+                },
+            )
+        });
+        let endpoint = bound_rx.await?;
+        ready(&endpoint, "mtls")?;
+        tokio::select! {
+            _ = stop => {},
+            result = &mut task => { result??; return Err("TCP listener stopped early".into()); },
+        }
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+    } else {
+        let state = HttpState::builder()
+            .server(rpc)
+            .authenticate(bearer_authenticate_static(HashMap::from([(
+                token,
+                AuthContext::for_principal("bearer", "load-principal"),
+            )])))
+            .max_body_size(2 * 1024 * 1024)
+            .max_request_bytes(2 * 1024 * 1024)
+            .request_timeout(Duration::from_secs(10))
+            .build();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await?;
+        ready(&format!("http://{}", listener.local_addr()?), "http")?;
+        axum::serve(listener, vgi_rpc::http::build_router(state))
+            .with_graceful_shutdown(stop)
+            .await?;
+    }
     reaper.abort();
     let before = manager.resource_counts()?;
     manager.close_all()?;
@@ -138,6 +180,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let after = manager.resource_counts()?;
     let report = serde_json::json!({
         "http_host": "rust", "worker": "direct", "runtime_threads": 1,
+        "transport": if args.tls_dir.is_some() { "mtls" } else { "http" },
         "rows": args.rows, "batch_rows": args.batch_rows, "payload_bytes": args.payload_bytes,
         "connections_opened": counters.opened.load(Ordering::Relaxed),
         "connections_closed": counters.closed.load(Ordering::Relaxed),
@@ -165,4 +208,28 @@ async fn terminate_signal() {
         return;
     }
     std::future::pending::<()>().await;
+}
+
+fn ready(endpoint: &str, transport: &str) -> io::Result<()> {
+    println!(
+        "{}",
+        serde_json::json!({"endpoint": endpoint,
+        "sample_pid": std::process::id(), "transport": transport})
+    );
+    io::stdout().flush()
+}
+
+fn load_tls(directory: &Path) -> Result<TcpMutualTlsConfig, Box<dyn std::error::Error>> {
+    let certificates =
+        rustls::pki_types::CertificateDer::pem_file_iter(directory.join("server.pem"))?
+            .collect::<Result<Vec<_>, _>>()?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(directory.join("server-key.pem"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls::pki_types::CertificateDer::pem_file_iter(directory.join("ca.pem"))? {
+        roots.add(certificate?)?;
+    }
+    Ok(
+        TcpMutualTlsConfig::new(certificates, key, roots, ["benchmark.test"])?
+            .with_handshake_timeout(Duration::from_secs(5))?,
+    )
 }
