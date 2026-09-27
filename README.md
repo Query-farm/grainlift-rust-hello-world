@@ -8,7 +8,9 @@ The application uses Grainlift's existing server library for protocol 0.4,
 authentication, principal ownership, handle lifetimes, quotas, replay, errors,
 and pull-based Arrow results. Clients use the ordinary native Grainlift ADBC
 driver. The Grainlift dependency is pinned to a public Git revision; VGI-RPC
-comes from crates.io, with resolved dependencies in `Cargo.lock`.
+comes from crates.io, with resolved dependencies in `Cargo.lock`. VGI-RPC 0.27.3
+wakes the native TCP/mTLS listener on socket readiness; the old 50 ms accept
+sleep no longer delays new connections.
 
 ## Workload
 
@@ -64,7 +66,7 @@ rows per batch, 0–1,024 payload bytes, and
 32 statements and 32 results per session, a 2 MiB HTTP body, a 64 KiB command,
 and a ten-second idle lifetime. Server options cannot be overridden by callers.
 This is a local comparison application, not an Internet-facing deployment.
-The HTTP body limit is not a TCP framing limit. TCP retains VGI 0.27.1's
+The HTTP body limit is not a TCP framing limit. TCP retains VGI 0.27.3's
 existing IPC message guard (up to `u32::MAX` bytes), TLS handshake deadline,
 and shared Grainlift session/result limits. Its listener does not provide
 a configurable total accepted-connection ceiling. The diagnostic uses one

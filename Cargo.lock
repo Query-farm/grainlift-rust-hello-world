@@ -1408,7 +1408,7 @@ dependencies = [
 [[package]]
 name = "grainlift-protocol"
 version = "0.4.0"
-source = "git+https://github.com/Query-farm/grainlift.git?rev=1a1044f0c3152c1a8350b9c010101a8ad380ef91#1a1044f0c3152c1a8350b9c010101a8ad380ef91"
+source = "git+https://github.com/Query-farm/grainlift.git?rev=afe1fd0b774e759830603d4d29ddac87575f108f#afe1fd0b774e759830603d4d29ddac87575f108f"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -1441,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "grainlift-server"
 version = "0.4.0"
-source = "git+https://github.com/Query-farm/grainlift.git?rev=1a1044f0c3152c1a8350b9c010101a8ad380ef91#1a1044f0c3152c1a8350b9c010101a8ad380ef91"
+source = "git+https://github.com/Query-farm/grainlift.git?rev=afe1fd0b774e759830603d4d29ddac87575f108f#afe1fd0b774e759830603d4d29ddac87575f108f"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -2352,6 +2352,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -4625,9 +4626,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-iroh-transport"
-version = "0.27.1"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "970096853e8304c721fc70decd1c8aab6204b736e54141b80a59cd3651a08524"
+checksum = "c09b5e3acec14ed6b9d8fc992f9e995bd54a05a44814ed8ff968cd78916c85d3"
 dependencies = [
  "bytes",
  "http",
@@ -4642,9 +4643,9 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc"
-version = "0.27.1"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d76d6c9d8f4a5ea17be74eed214ee392b2d8f61d3943b3c49931346a35fb2410"
+checksum = "17ab4f36920170d7415d9962b0c1894ebcf4f98f71b929ab4a4cc1c20062b497"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4663,6 +4664,7 @@ dependencies = [
  "flate2",
  "hmac",
  "jsonwebtoken",
+ "mio",
  "percent-encoding",
  "rand 0.8.8",
  "reqwest 0.12.28",
@@ -4684,9 +4686,9 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-client"
-version = "0.27.1"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "710ddec06e83b4c59dc416f3ee72a945dc4b9e4154e1e10b550a59d28a2667b8"
+checksum = "ca913afab8b7e103737a4889ffc544168751faeaef7819f195200c3c9c4e6bba"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4702,9 +4704,9 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh"
-version = "0.27.1"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05161b722796f4ca0f038cf70b5a9d19d14803fc1de29428951c75108992b600"
+checksum = "cefc806be19ed5f499f8734918ce9b513c42244fe6e3219712536f5461d3ffde"
 dependencies = [
  "iroh",
  "thiserror 2.0.20",
@@ -4719,9 +4721,9 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.27.1"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34caed47d383ef3920714b83853309b19177a022192f69bef52d16cd1801b9da"
+checksum = "78771453836ad4bdc00e0eee2dfb7d8e459261a1c9cddc7a3df7f1ea94d4ef21"
 dependencies = [
  "proc-macro2",
  "quote",

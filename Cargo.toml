@@ -10,14 +10,17 @@ license = "Apache-2.0"
 description = "Bounded synthetic Grainlift worker for matched ADBC benchmarks"
 repository = "https://github.com/Query-farm/grainlift-rust-hello-world"
 
+# Keep this example independent when CI checks it out beneath another workspace.
+[workspace]
+
 [dependencies]
 adbc_core = { git = "https://github.com/apache/arrow-adbc.git", rev = "616acfdfcea9b66956fdb3d11437b6cf24edbc39" }
 arrow-array = "59"
 arrow-schema = "59"
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
-grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "1a1044f0c3152c1a8350b9c010101a8ad380ef91" }
+grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "afe1fd0b774e759830603d4d29ddac87575f108f" }
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["full"] }
-vgi-rpc = { version = "0.27.1", features = ["http", "tcp-mtls"] }
+vgi-rpc = { version = "0.27.3", features = ["http", "tcp-mtls"] }
