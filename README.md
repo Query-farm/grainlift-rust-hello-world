@@ -50,14 +50,35 @@ Connect with `autocommit=True` and database options `grainlift.uri`,
 `grainlift.target=default`, and `grainlift.auth.bearer_token`. Run `QUERY` through
 the ordinary ADBC cursor.
 
+For two-principal interoperability tests, set a different token of at least
+16 bytes in `GRAINLIFT_HELLO_OTHER_TOKEN`. The primary and secondary tokens then
+identify separate principals authorized for the same `default` target. The
+secondary token is optional for the single-client benchmark; duplicate or short
+secondary tokens cause startup to fail. Handle ownership remains enforced by
+the shared Grainlift server.
+
+The shared worker conformance fixture supplies both tokens and runs the native
+ADBC client against this process. From the sibling Grainlift checkout, pass the
+compiled driver and worker paths:
+
+```console
+python -m pytest validation/conformance -q \
+  --native-driver /absolute/path/libadbc_driver_grainlift.so \
+  --worker-command '["/absolute/path/grainlift-rust-hello-world"]'
+```
+
 To select authenticated TCP, pass `--tls-dir /private/test-certificates`.
 The directory must contain `server.pem`, `server-key.pem`, and `ca.pem`.
 The server verifies client certificates against that CA and permits only
-`spiffe://benchmark.test/client` in trust domain `benchmark.test`. The client
+`spiffe://benchmark.test/client` and `spiffe://benchmark.test/other` in trust
+domain `benchmark.test`; the `denied` fixture identity is not authorized. The client
 uses `grainlift.tls.ca`, `grainlift.tls.cert`, `grainlift.tls.key`, and
 `grainlift.tls.server_name=localhost` instead of a bearer token. The native
 URI is `tls+tcp://127.0.0.1:PORT`. The companion validation script creates
 one-day test certificates; never commit these files or use them in production.
+The shared conformance fixture selects this mode with `--worker-transport mtls`
+and `--worker-tls-dir`. An explicit `--transport http` is also accepted;
+unsupported transport names fail at argument parsing.
 
 Dimensions are configurable using `--rows`, `--batch-rows`, and
 `--payload-bytes`. Limits match the Python worker: 1–1,000,000 rows, 1–4,096
@@ -120,5 +141,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Tests cover schema/value/batch parity, allocation limits, lazy early close,
 independent cursors, structured error recovery, unsupported operations and
-option rejection. See Grainlift's recorded validation evidence for native
+option rejection. The shared Grainlift conformance suite also exercises the
+ordinary ADBC driver against this worker over HTTP or mTLS, including distinct
+authenticated principals. This synthetic worker cannot exercise SQL write
+visibility, transactions, or ingestion; those belong to the real-database
+end-to-end suite. See Grainlift's recorded validation evidence for native
 C-ABI integration, single-client timings, resource sampling and limitations.

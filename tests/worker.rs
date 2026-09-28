@@ -184,3 +184,67 @@ fn supplied_options_are_not_silently_ignored() {
     assert_eq!(counters.opened.load(Ordering::Relaxed), 0);
     assert_eq!(counters.closed.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn independent_clients_keep_live_results_and_errors_isolated() {
+    let counters = Arc::new(Counters::default());
+    let backend = Arc::new(SyntheticBackend {
+        workload: Workload::new(513, 512, 64).unwrap(),
+        counters: counters.clone(),
+    });
+    let mut alice_connection = backend.open(&target(), vec![], vec![]).unwrap();
+    let mut alice_statement = alice_connection.new_statement().unwrap();
+    alice_statement.set_sql_query("QUERY").unwrap();
+    let mut alice_result = alice_statement.execute().unwrap();
+    assert_eq!(alice_result.next().unwrap().unwrap().num_rows(), 512);
+
+    let bob_backend = backend.clone();
+    std::thread::spawn(move || {
+        let mut connection = bob_backend.open(&target(), vec![], vec![]).unwrap();
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("FAIL").unwrap();
+        assert_eq!(
+            statement.execute().err().unwrap().status,
+            Status::InvalidData
+        );
+        statement.set_sql_query("QUERY").unwrap();
+        let mut result = statement.execute().unwrap();
+        assert_eq!(result.next().unwrap().unwrap().num_rows(), 512);
+        assert_eq!(result.next().unwrap().unwrap().num_rows(), 1);
+        assert!(result.next().is_none());
+    })
+    .join()
+    .unwrap();
+    assert_eq!(alice_result.next().unwrap().unwrap().num_rows(), 1);
+    assert!(alice_result.next().is_none());
+    drop(alice_result);
+    drop(alice_statement);
+    drop(alice_connection);
+    assert_eq!(counters.opened.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.closed.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.queries.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.failures.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.batches.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn bounded_client_churn_releases_backend_connections_and_partial_results() {
+    let counters = Arc::new(Counters::default());
+    let backend = SyntheticBackend {
+        workload: Workload::new(513, 512, 64).unwrap(),
+        counters: counters.clone(),
+    };
+    for cycle in 1..=64 {
+        let mut connection = backend.open(&target(), vec![], vec![]).unwrap();
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("QUERY").unwrap();
+        let mut result = statement.execute().unwrap();
+        assert_eq!(result.next().unwrap().unwrap().num_rows(), 512);
+        drop(result);
+        drop(statement);
+        drop(connection);
+        assert_eq!(counters.opened.load(Ordering::Relaxed), cycle);
+        assert_eq!(counters.closed.load(Ordering::Relaxed), cycle);
+        assert_eq!(counters.batches.load(Ordering::Relaxed), cycle);
+    }
+}

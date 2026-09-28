@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Query Farm LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use grainlift_rust_hello_world::{Counters, SyntheticBackend, Workload};
 use grainlift_server::config::TargetConfig;
 use grainlift_server::service::build_server_with_max_bind;
@@ -28,6 +28,9 @@ struct Args {
     /// Certificate directory selects authenticated TCP instead of HTTP.
     #[arg(long)]
     tls_dir: Option<PathBuf>,
+    /// Explicit transport for the shared worker conformance fixture.
+    #[arg(long)]
+    transport: Option<Transport>,
     #[arg(long, default_value_t = 0)]
     port: u16,
     #[arg(long, default_value_t = 4096)]
@@ -38,6 +41,12 @@ struct Args {
     payload_bytes: usize,
     #[arg(long)]
     report: PathBuf,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Transport {
+    Http,
+    Mtls,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
@@ -52,10 +61,24 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let workload = Workload::new(args.rows, args.batch_rows, args.payload_bytes)?;
+    let mtls = match (args.transport, args.tls_dir.is_some()) {
+        (None | Some(Transport::Http), false) => false,
+        (None | Some(Transport::Mtls), true) => true,
+        _ => return Err("mTLS transport requires --tls-dir; HTTP does not accept it".into()),
+    };
     let token = std::env::var("GRAINLIFT_HELLO_TOKEN").unwrap_or_default();
-    if args.tls_dir.is_none() && token.len() < 16 {
-        return Err("A bearer token of at least 16 bytes is required".into());
-    }
+    let other_token = std::env::var("GRAINLIFT_HELLO_OTHER_TOKEN").unwrap_or_default();
+    let (bearer_credentials, authorized_targets) = if mtls {
+        (
+            HashMap::new(),
+            HashMap::from([
+                (mtls_principal("client"), vec!["default".into()]),
+                (mtls_principal("other"), vec!["default".into()]),
+            ]),
+        )
+    } else {
+        bearer_config(token, other_token)?
+    };
     let counters = Arc::new(Counters::default());
     let target = TargetConfig {
         driver: "synthetic".into(),
@@ -81,15 +104,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_statements_per_session: 32,
             max_results_per_session: 32,
         },
-        TargetAuthorizer::new(HashMap::from([(
-            if args.tls_dir.is_some() {
-                "peer/spiffe/spiffe%3A%2F%2Fbenchmark.test/spiffe%3A%2F%2Fbenchmark.test%2Fclient"
-                    .into()
-            } else {
-                "load-principal".into()
-            },
-            vec!["default".into()],
-        )])),
+        TargetAuthorizer::new(authorized_targets),
         Duration::from_secs(5),
     ));
     let rpc = Arc::new(build_server_with_max_bind(
@@ -151,10 +166,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let state = HttpState::builder()
             .server(rpc)
-            .authenticate(bearer_authenticate_static(HashMap::from([(
-                token,
-                AuthContext::for_principal("bearer", "load-principal"),
-            )])))
+            .authenticate(bearer_authenticate_static(bearer_credentials))
             .max_body_size(2 * 1024 * 1024)
             .max_request_bytes(2 * 1024 * 1024)
             .request_timeout(Duration::from_secs(10))
@@ -180,7 +192,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let after = manager.resource_counts()?;
     let report = serde_json::json!({
         "http_host": "rust", "worker": "direct", "runtime_threads": 1,
-        "transport": if args.tls_dir.is_some() { "mtls" } else { "http" },
+        "transport": if mtls { "mtls" } else { "http" },
         "rows": args.rows, "batch_rows": args.batch_rows, "payload_bytes": args.payload_bytes,
         "connections_opened": counters.opened.load(Ordering::Relaxed),
         "connections_closed": counters.closed.load(Ordering::Relaxed),
@@ -197,6 +209,64 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         format!("{}\n", serde_json::to_string_pretty(&report)?),
     )?;
     Ok(())
+}
+
+fn mtls_principal(name: &str) -> String {
+    format!("peer/spiffe/spiffe%3A%2F%2Fbenchmark.test/spiffe%3A%2F%2Fbenchmark.test%2F{name}")
+}
+
+fn bearer_config(
+    token: String,
+    other_token: String,
+) -> Result<(HashMap<String, AuthContext>, HashMap<String, Vec<String>>), &'static str> {
+    if token.len() < 16 {
+        return Err("A bearer token of at least 16 bytes is required");
+    }
+    if !other_token.is_empty() && (other_token.len() < 16 || other_token == token) {
+        return Err("A distinct secondary bearer token of at least 16 bytes is required");
+    }
+    let mut credentials = HashMap::from([(
+        token,
+        AuthContext::for_principal("bearer", "load-principal"),
+    )]);
+    let mut targets = HashMap::from([("load-principal".into(), vec!["default".into()])]);
+    if !other_token.is_empty() {
+        credentials.insert(
+            other_token,
+            AuthContext::for_principal("bearer", "other-principal"),
+        );
+        targets.insert("other-principal".into(), vec!["default".into()]);
+    }
+    Ok((credentials, targets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bearer_config, mtls_principal};
+
+    #[test]
+    fn optional_second_bearer_identity_is_distinct_and_authorized() {
+        let (single, single_targets) =
+            bearer_config("first-long-secret".into(), String::new()).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single_targets.len(), 1);
+
+        let (both, both_targets) =
+            bearer_config("first-long-secret".into(), "second-long-secret".into()).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both_targets.len(), 2);
+        assert!(both_targets.contains_key("load-principal"));
+        assert!(both_targets.contains_key("other-principal"));
+        assert!(bearer_config("short".into(), String::new()).is_err());
+        assert!(bearer_config("same-long-secret".into(), "same-long-secret".into()).is_err());
+        assert!(bearer_config("first-long-secret".into(), "too-short".into()).is_err());
+    }
+
+    #[test]
+    fn mtls_fixture_identities_are_distinct() {
+        assert_ne!(mtls_principal("client"), mtls_principal("other"));
+        assert_ne!(mtls_principal("client"), mtls_principal("denied"));
+    }
 }
 
 async fn terminate_signal() {
