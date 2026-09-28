@@ -22,6 +22,9 @@ use vgi_rpc::tcp::{
     TcpIdentityOptions, TcpMutualTlsConfig, TcpMutualTlsOptions, serve_tcp_with_mtls_identity,
 };
 
+type BearerCredentials = HashMap<String, AuthContext>;
+type TargetGrants = HashMap<String, Vec<String>>;
+
 /// A loopback-only synthetic ADBC service. Authentication is always required.
 #[derive(Parser)]
 struct Args {
@@ -218,7 +221,7 @@ fn mtls_principal(name: &str) -> String {
 fn bearer_config(
     token: String,
     other_token: String,
-) -> Result<(HashMap<String, AuthContext>, HashMap<String, Vec<String>>), &'static str> {
+) -> Result<(BearerCredentials, TargetGrants), &'static str> {
     if token.len() < 16 {
         return Err("A bearer token of at least 16 bytes is required");
     }
@@ -238,35 +241,6 @@ fn bearer_config(
         targets.insert("other-principal".into(), vec!["default".into()]);
     }
     Ok((credentials, targets))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{bearer_config, mtls_principal};
-
-    #[test]
-    fn optional_second_bearer_identity_is_distinct_and_authorized() {
-        let (single, single_targets) =
-            bearer_config("first-long-secret".into(), String::new()).unwrap();
-        assert_eq!(single.len(), 1);
-        assert_eq!(single_targets.len(), 1);
-
-        let (both, both_targets) =
-            bearer_config("first-long-secret".into(), "second-long-secret".into()).unwrap();
-        assert_eq!(both.len(), 2);
-        assert_eq!(both_targets.len(), 2);
-        assert!(both_targets.contains_key("load-principal"));
-        assert!(both_targets.contains_key("other-principal"));
-        assert!(bearer_config("short".into(), String::new()).is_err());
-        assert!(bearer_config("same-long-secret".into(), "same-long-secret".into()).is_err());
-        assert!(bearer_config("first-long-secret".into(), "too-short".into()).is_err());
-    }
-
-    #[test]
-    fn mtls_fixture_identities_are_distinct() {
-        assert_ne!(mtls_principal("client"), mtls_principal("other"));
-        assert_ne!(mtls_principal("client"), mtls_principal("denied"));
-    }
 }
 
 async fn terminate_signal() {
@@ -302,4 +276,33 @@ fn load_tls(directory: &Path) -> Result<TcpMutualTlsConfig, Box<dyn std::error::
         TcpMutualTlsConfig::new(certificates, key, roots, ["benchmark.test"])?
             .with_handshake_timeout(Duration::from_secs(5))?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bearer_config, mtls_principal};
+
+    #[test]
+    fn optional_second_bearer_identity_is_distinct_and_authorized() {
+        let (single, single_targets) =
+            bearer_config("first-long-secret".into(), String::new()).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single_targets.len(), 1);
+
+        let (both, both_targets) =
+            bearer_config("first-long-secret".into(), "second-long-secret".into()).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both_targets.len(), 2);
+        assert!(both_targets.contains_key("load-principal"));
+        assert!(both_targets.contains_key("other-principal"));
+        assert!(bearer_config("short".into(), String::new()).is_err());
+        assert!(bearer_config("same-long-secret".into(), "same-long-secret".into()).is_err());
+        assert!(bearer_config("first-long-secret".into(), "too-short".into()).is_err());
+    }
+
+    #[test]
+    fn mtls_fixture_identities_are_distinct() {
+        assert_ne!(mtls_principal("client"), mtls_principal("other"));
+        assert_ne!(mtls_principal("client"), mtls_principal("denied"));
+    }
 }
