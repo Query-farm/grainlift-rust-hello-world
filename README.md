@@ -1,149 +1,171 @@
 # grainlift-rust-hello-world
 
-A bounded synthetic Rust ADBC service for comparing Grainlift's Rust and Python
-server paths. It implements the same workload as
-`grainlift/validation/regression/soak/worker.py`; it does not run a SQL engine.
+A complete ADBC service in about 300 lines of Rust, built with the
+[Grainlift](https://github.com/Query-farm/grainlift) server library
+(`grainlift-server`). Any ADBC application connects to it through the native
+Grainlift driver; the service itself needs no database, SQL engine or
+downstream driver.
 
-The application uses Grainlift's existing server library for protocol 0.4,
-authentication, principal ownership, handle lifetimes, quotas, replay, errors,
-and pull-based Arrow results. Clients use the ordinary native Grainlift ADBC
-driver. The Grainlift dependency is pinned to a public Git revision; VGI-RPC
-comes from crates.io, with resolved dependencies in `Cargo.lock`. VGI-RPC 0.27.3
-wakes the native TCP/mTLS listener on socket readiness; the old 50 ms accept
-sleep no longer delays new connections.
+## Quickstart
 
-## Workload
+Requires Rust 1.97+ (which also builds the native Grainlift ADBC driver once).
 
-`QUERY` returns two nullable fields: `number: int64` and `payload: binary`.
-Defaults are 4,096 rows, numbered 0 through 4,095, with 64 `x` bytes per row,
-in exactly eight 512-row batches. Every batch is allocated lazily on its pull.
-`FAIL` returns ADBC `INVALID_DATA` with SQLSTATE `22000`. Another command
-returns `INVALID_ARGUMENTS`; execution before setting a command returns
-`INVALID_STATE`. Commands are exact and case-sensitive, matching the Python
-synthetic worker.
+    git clone https://github.com/Query-farm/grainlift.git ../grainlift
+    (cd ../grainlift && cargo build --locked -p adbc-driver-grainlift)
 
-The worker supports enabling autocommit. Transactions, preparation, binding,
-ingestion, metadata, partitions, Substrait and downstream cancellation return
-`NOT_IMPLEMENTED`. These limitations belong to this synthetic backend; they
-do not describe the capabilities of the shared Grainlift server.
+Start the service:
 
-## Run
+    cargo run --release
 
-Requires Rust 1.97 or newer. Build and benchmark on the designated EC2 machine
-for this project, not the developer laptop:
+No credentials are needed. The service is read-only, so it accepts anonymous
+clients (see [Authentication](#authentication)).
 
-```console
-cargo build --locked --release
-export GRAINLIFT_HELLO_TOKEN=local-development-token-change-me
-./target/release/grainlift-rust-hello-world --port 8080 --report /tmp/synthetic-report.json
-```
+### Query it from SQL
 
-The listener is always loopback-only. HTTP requires bearer authentication;
-the optional TCP listener requires a verified and authorized client certificate.
-The first stdout line is a small JSON readiness message containing the endpoint
-and serving PID. It never contains the token. A stdin byte, stdin EOF, Ctrl-C,
-or SIGTERM requests shutdown. Keep stdin open when supervising the process.
-The shutdown report contains aggregate counters and resource counts, never
-SQL, values, credentials or raw downstream errors.
+[Haybarn](https://github.com/Query-farm-haybarn/haybarn), Query.Farm's DuckDB
+distribution, loads the Grainlift driver through the `adbc_scanner` extension.
+In a second terminal, run [`examples/query.sql`](examples/query.sql):
 
-Connect with `autocommit=True` and database options `grainlift.uri`,
-`grainlift.target=default`, and `grainlift.auth.bearer_token`. Run `QUERY` through
-the ordinary ADBC cursor.
+    export GRAINLIFT_DRIVER=$PWD/../grainlift/target/debug/libadbc_driver_grainlift.dylib  # .so on Linux
+    uvx haybarn-cli < examples/query.sql
 
-For two-principal interoperability tests, set a different token of at least
-16 bytes in `GRAINLIFT_HELLO_OTHER_TOKEN`. The primary and secondary tokens then
-identify separate principals authorized for the same `default` target. The
-secondary token is optional for the single-client benchmark; duplicate or short
-secondary tokens cause startup to fail. Handle ownership remains enforced by
-the shared Grainlift server.
+The same script runs unchanged in the DuckDB CLI. It prints:
 
-The shared worker conformance fixture supplies both tokens and runs the native
-ADBC client against this process. From the sibling Grainlift checkout, pass the
-compiled driver and worker paths:
+    ┌───────────────┐
+    │    message    │
+    │    varchar    │
+    ├───────────────┤
+    │ Hello, world! │
+    └───────────────┘
+    ┌─────────┬────────────┐
+    │ numbers │   total    │
+    │  int64  │   int128   │
+    ├─────────┼────────────┤
+    │  100000 │ 4999950000 │
+    └─────────┴────────────┘
+    ...
 
-```console
-python -m pytest validation/conformance -q \
-  --native-driver /absolute/path/libadbc_driver_grainlift.so \
-  --worker-command '["/absolute/path/grainlift-rust-hello-world"]'
-```
+`adbc_scan` sends its quoted SQL to this service. The rows come back as an
+ordinary relation that you can join, aggregate or export locally.
 
-To select authenticated TCP, pass `--tls-dir /private/test-certificates`.
-The directory must contain `server.pem`, `server-key.pem`, and `ca.pem`.
-The server verifies client certificates against that CA and permits only
-`spiffe://benchmark.test/client` and `spiffe://benchmark.test/other` in trust
-domain `benchmark.test`; the `denied` fixture identity is not authorized. The client
-uses `grainlift.tls.ca`, `grainlift.tls.cert`, `grainlift.tls.key`, and
-`grainlift.tls.server_name=localhost` instead of a bearer token. The native
-URI is `tls+tcp://127.0.0.1:PORT`. The companion validation script creates
-one-day test certificates; never commit these files or use them in production.
-The shared conformance fixture selects this mode with `--worker-transport mtls`
-and `--worker-tls-dir`. An explicit `--transport http` is also accepted;
-unsupported transport names fail at argument parsing.
+### Query it from Rust
 
-Dimensions are configurable using `--rows`, `--batch-rows`, and
-`--payload-bytes`. Limits match the Python worker: 1–1,000,000 rows, 1–4,096
-rows per batch, 0–1,024 payload bytes, and
-`batch_rows * (payload_bytes + 16) <= 1 MiB`. The service admits three sessions,
-32 statements and 32 results per session, a 2 MiB HTTP body, a 64 KiB command,
-and a ten-second idle lifetime. Server options cannot be overridden by callers.
-This is a local comparison application, not an Internet-facing deployment.
-The HTTP body limit is not a TCP framing limit. TCP retains VGI 0.27.3's
-existing IPC message guard (up to `u32::MAX` bytes), TLS handshake deadline,
-and shared Grainlift session/result limits. Its listener does not provide
-a configurable total accepted-connection ceiling. The diagnostic uses one
-trusted client and bounded synthetic inputs; this does not qualify the
-listener for hostile clients or public exposure.
+[`examples/client.rs`](examples/client.rs) uses the standard ADBC driver
+manager (`adbc_driver_manager`):
 
-## Matched single-client comparison
+    cargo run --example client
 
-The companion Grainlift harness runs Rust, Python/Granian in-process, and
-Python/Granian with an isolated backend **sequentially**, using the exact same
-native driver binary and Python verification loop. Each case opens one
-connection, warms ten queries, then measures 1,000 queries with expected errors
-every ten queries. Schema, values, batch boundaries and cleanup are checked.
-Three repetitions rotate host order. A separate one-batch comparison holds
-total rows and payload constant while reducing batch RPC count.
+It prints:
 
-```console
-bash ../grainlift/validation/diagnostics/run_matched.sh \
-  /absolute/grainlift /absolute/evidence \
-  /absolute/libadbc_driver_grainlift.so \
-  /absolute/grainlift-rust-hello-world
-```
+    message: ["Hello, world!"]
+    numbers(2500): [1024, 1024, 452] rows per Arrow batch
+    running_total(2500): last row number=2499, total=3123750
+    Empty result: 0 rows, schema: Field { "number": nullable Int64 }
 
-The primary Rust/Python comparison uses an in-process backend on both sides.
-Python process isolation is measured separately. This compares complete service
-implementations, not isolated language execution: Rust retains Grainlift's
-session actor and Rust transport, while Python uses its SDK and Granian.
-All cases use one client, so no concurrency scaling claim follows from them.
+## What's in the crate
 
-`validation/diagnostics/run_transports.sh` in Grainlift additionally compares
-Rust HTTP, Python/Granian HTTP, Rust TCP/mTLS, and Python TCP/mTLS with
-in-process backends and the same native driver. TCP results use a separate
-stream connection per query, including a TLS handshake; only initial session
-startup is excluded. See that harness's README for reproduction and transport
-limitations. HTTP bearer authentication and TCP certificate authentication
-remain enabled, so this compares complete paths rather than framing alone.
+| File | Contents |
+| --- | --- |
+| [`src/lib.rs`](src/lib.rs) | The service: `HelloBackend` → `HelloConnection` → `HelloStatement`, plus the two result styles below |
+| [`src/main.rs`](src/main.rs) | The `grainlift-rust-hello-world` command |
 
-The [2026-09-26 EC2 results](https://github.com/Query-farm/grainlift/blob/main/validation/load-results/ec2-matched-synthetic-20260926/README.md)
-average 9.39 ms/query for Rust, 17.72 ms for Python/Granian in-process, and
-22.19 ms for Python/Granian with an isolated backend. Every case passed exact
-result verification and resource recovery. The report includes raw evidence,
-stage timings, resource measurements and limitations.
+The service answers three queries:
 
-## Checks
+| Query | Result | Demonstrates |
+| --- | --- | --- |
+| `SELECT 'Hello, world!' AS message` | one row | the smallest possible result |
+| `SELECT * FROM numbers(n)` | 0..n-1 | a **`RecordBatchReader`** of Arrow batches |
+| `SELECT * FROM running_total(n)` | 0..n-1 with a running sum | a serializable **`ResultProducer`** |
 
-```console
-cargo fmt --all --check
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-```
+`n` ranges from 0 to 100000. Anything else is an ADBC `INVALID_ARGUMENT` error
+with SQLSTATE 42000. The example matches these queries exactly rather than
+pretending to parse SQL.
 
-Tests cover schema/value/batch parity, allocation limits, lazy early close,
-independent cursors, structured error recovery, unsupported operations and
-option rejection. The shared Grainlift conformance suite also exercises the
-ordinary ADBC driver against this worker over HTTP or mTLS, including distinct
-authenticated principals. This synthetic worker cannot exercise SQL write
-visibility, transactions, or ingestion; those belong to the real-database
-end-to-end suite. See Grainlift's recorded validation evidence for native
-C-ABI integration, single-client timings, resource sampling and limitations.
+`HelloStatement` implements the ADBC statement lifecycle: set the SQL, then
+`prepare`, `execute_schema` and `execute_result`. Preparation matters because
+clients such as `adbc_scanner` prepare every query before running it. Every
+operation the example does not implement (transactions, binding, metadata and
+so on) returns ADBC `NOT_IMPLEMENTED` through the Grainlift traits' defaults.
+
+### Readers vs. producers
+
+Both styles stream lazily in batches of at most 1024 rows, and you can mix them
+freely within one service.
+
+- **Reader** (`numbers`): return `QueryResult::from_reader(reader)` (or
+  implement `BackendStatement::execute`). It's the simplest option, and it can
+  hold resources such as an open database cursor. The reader lives in server
+  memory until the client finishes or releases the result.
+- **Producer** (`running_total`): a struct whose fields are the entire
+  resumable state, deriving `Serialize`, `Deserialize` and VGI-RPC's
+  `StreamState`. Implement `ResultProducer::produce` and return
+  `QueryResult::from_producer(schema, state)`. Over HTTP the state is
+  serialized into the encrypted continuation token after each batch. The server
+  keeps no iterator or replay batch between fetches, and a retried fetch
+  recomputes its batch from the token. This is the same approach VGI-RPC
+  streams use.
+
+Pick a producer when the state is small and serializable, such as offsets,
+keyset cursors or counters (64 KiB by default). Pick a reader when it isn't.
+
+## Authentication
+
+Anonymous access is opt-in in Grainlift. This example enables it because it
+only serves public, read-only data: its `main` calls
+`dev::run(..., RunOptions::new(...).auth(Auth::Anonymous))`. Requests without
+credentials act as the shared `anonymous` principal.
+
+- Set `GRAINLIFT_TOKEN` on both sides to connect as an authenticated principal
+  instead. A client that sends a wrong token is rejected, never downgraded to
+  anonymous.
+- Run `cargo run --release -- --auth token` to require a token. The server
+  prints a generated token when `GRAINLIFT_TOKEN` is unset.
+
+For a service that can write data or expose private data, keep token
+authentication. In your own hosting code, anonymous access is
+`grainlift_server::hosting::http_authenticator(tokens, Some("anonymous"))`,
+served with `grainlift_server::dev::Service::serve_http`.
+
+## Hosting options
+
+`cargo run --release -- --help` lists them.
+
+- `--host http` (default): loopback HTTP for development; it drains on
+  SIGTERM/Ctrl-C.
+- `--host mtls`: verified TCP/mTLS; client certificates identify callers.
+- `--port`: listening port (default 8080). Point the client at a different
+  port with `GRAINLIFT_ENDPOINT`.
+
+For mTLS, supply the server chain, key, client CA and the authorized client's
+SPIFFE ID (its certificate URI SAN):
+
+    cargo run --release -- --host mtls --port 8443 \
+      --tls-cert server.pem --tls-key server-key.pem \
+      --client-ca clients-ca.pem --client-uri spiffe://example.org/client
+
+    export GRAINLIFT_ENDPOINT=tls+tcp://127.0.0.1:8443
+    export GRAINLIFT_TLS_CA=server-ca.pem GRAINLIFT_TLS_CERT=client.pem GRAINLIFT_TLS_KEY=client-key.pem
+    export GRAINLIFT_TLS_SERVER_NAME=localhost   # the DNS name in the server certificate
+    cargo run --example client
+
+These hosts are for development and bind to loopback. For production, build
+your own host from `grainlift_server`'s session manager, limits and listeners;
+see the Grainlift [security guide](https://github.com/Query-farm/grainlift/blob/main/docs/security.md).
+
+## Development
+
+    cargo fmt --check
+    cargo clippy --all-targets --locked -- -D warnings
+    GRAINLIFT_DRIVER=$PWD/../grainlift/target/debug/libadbc_driver_grainlift.dylib cargo test --locked
+
+Native integration tests skip when `GRAINLIFT_DRIVER` is unset. The Haybarn
+test also needs the Haybarn CLI (`uv tool install haybarn-cli`, or set
+`HAYBARN` to its path); it downloads the `adbc_scanner` extension on first use.
+CI builds a pinned native-driver revision and runs everything on Linux and
+macOS.
+
+The `grainlift-server` dependency is pinned to a Git revision of
+[Query-farm/grainlift](https://github.com/Query-farm/grainlift); update it
+together with the driver revision in CI. The synthetic benchmark worker that
+used to live here is now Grainlift's own validation fixture,
+[`validation/synthetic-worker`](https://github.com/Query-farm/grainlift/tree/main/validation/synthetic-worker).

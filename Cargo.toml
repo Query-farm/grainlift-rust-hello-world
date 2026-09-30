@@ -3,24 +3,29 @@
 
 [package]
 name = "grainlift-rust-hello-world"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
-description = "Bounded synthetic Grainlift worker for matched ADBC benchmarks"
+description = "A minimal ADBC service written in Rust with the Grainlift server library"
 repository = "https://github.com/Query-farm/grainlift-rust-hello-world"
+publish = false
 
-# Keep this example independent when CI checks it out beneath another workspace.
+# Keep this example independent when it is checked out beneath another workspace.
 [workspace]
 
 [dependencies]
-adbc_core = { git = "https://github.com/apache/arrow-adbc.git", rev = "616acfdfcea9b66956fdb3d11437b6cf24edbc39" }
-arrow-array = "59"
-arrow-schema = "59"
-axum = "0.7"
-clap = { version = "4", features = ["derive"] }
-grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "afe1fd0b774e759830603d4d29ddac87575f108f" }
+# Use the same arrow-adbc revision as grainlift-server so the ADBC types match.
+adbc_core = { git = "https://github.com/apache/arrow-adbc.git", rev = "c942d481c6e083040c68676e3dd454dad89503e9" }
+arrow-array = "60"
+arrow-schema = "60"
+# CI builds the native ADBC driver from this same grainlift revision.
+grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "50f84f4e55de43ce70f0303a914cb582a262b2a2" }
+serde = { version = "1", features = ["derive"] }
+# StreamState (serializable producer state) comes from VGI-RPC.
+vgi-rpc = { version = "0.28.0", default-features = false, features = ["macros", "stream-codec"] }
+
+[dev-dependencies]
+adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc.git", rev = "c942d481c6e083040c68676e3dd454dad89503e9" }
 serde_json = "1"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-tokio = { version = "1", features = ["full"] }
-vgi-rpc = { version = "0.27.3", features = ["http", "tcp-mtls"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }

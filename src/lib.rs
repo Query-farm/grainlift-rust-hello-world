@@ -1,336 +1,285 @@
 // Copyright (c) 2026 Query Farm LLC
 // SPDX-License-Identifier: Apache-2.0
 
+//! The hello-world service: three queries, no SQL engine.
+//!
+//! - `SELECT 'Hello, world!' AS message`: a single-row result.
+//! - `SELECT * FROM numbers(n)`: rows 0..n-1 from an ordinary
+//!   **[`RecordBatchReader`]**. Simple, and fine whenever the server keeps the
+//!   cursor in memory; it can also hold resources such as a database cursor.
+//! - `SELECT * FROM running_total(n)`: rows 0..n-1 with a running sum, from a
+//!   serializable **[`ResultProducer`]**. Over HTTP the producer's fields
+//!   travel in the encrypted continuation token after every batch, so the
+//!   server keeps no per-result iterator, and a retried fetch recomputes its
+//!   batch from the token.
+//!
+//! Run it with `cargo run --release`; `src/main.rs` hands [`HelloBackend`] to
+//! the Grainlift development host.
+
+use std::sync::Arc;
+
 use adbc_core::error::{Error, Result, Status};
-use adbc_core::options::{InfoCode, ObjectDepth, OptionValue};
-use adbc_core::{CancelHandle, PartitionedResult};
-use arrow_array::{BinaryArray, Int64Array, RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use grainlift_server::backend::{Backend, BackendConnection, BackendStatement};
-use grainlift_server::config::TargetConfig;
-use std::collections::HashSet;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use adbc_core::options::OptionValue;
+use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use grainlift_server::backend::{
+    Backend, BackendConnection, BackendStatement, QueryResult, ResultProducer,
 };
+use grainlift_server::config::TargetConfig;
+use serde::{Deserialize, Serialize};
+use vgi_rpc::StreamState;
 
-type Reader = Box<dyn RecordBatchReader + Send>;
+/// Largest `n` accepted by `numbers(n)` and `running_total(n)`.
+pub const MAX_ROWS: i64 = 100_000;
+/// Rows per Arrow batch.
+pub const BATCH_ROWS: i64 = 1024;
 
-/// Dimensions identical to the Python soak worker.
-#[derive(Clone, Copy, Debug)]
-pub struct Workload {
-    rows: usize,
-    batch_rows: usize,
-    payload_bytes: usize,
+const SUPPORTED: &str = "Supported queries: SELECT 'Hello, world!' AS message; \
+    SELECT * FROM numbers(n) or running_total(n), where 0 <= n <= 100000";
+
+/// Schema of `SELECT 'Hello, world!' AS message`.
+pub fn hello_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "message",
+        DataType::Utf8,
+        true,
+    )]))
 }
 
-impl Workload {
-    pub fn new(rows: usize, batch_rows: usize, payload_bytes: usize) -> Result<Self> {
-        if !(1..=1_000_000).contains(&rows)
-            || !(1..=4096).contains(&batch_rows)
-            || payload_bytes > 1024
-            || batch_rows * (payload_bytes + 16) > 1024 * 1024
-        {
-            return Err(error(
-                "Invalid workload dimensions",
-                Status::InvalidArguments,
-            ));
+/// Schema of `numbers(n)`.
+pub fn numbers_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "number",
+        DataType::Int64,
+        true,
+    )]))
+}
+
+/// Schema of `running_total(n)`.
+pub fn running_total_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("number", DataType::Int64, true),
+        Field::new("total", DataType::Int64, true),
+    ]))
+}
+
+/// Read 0..count-1 lazily, in batches of at most [`BATCH_ROWS`] rows.
+pub fn numbers(count: i64) -> Box<dyn RecordBatchReader + Send> {
+    let schema = numbers_schema();
+    let batches = (0..count).step_by(BATCH_ROWS as usize).map({
+        let schema = schema.clone();
+        move |start| {
+            let values = Int64Array::from_iter_values(start..count.min(start + BATCH_ROWS));
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(values)])
         }
-        Ok(Self {
-            rows,
-            batch_rows,
-            payload_bytes,
+    });
+    Box::new(RecordBatchIterator::new(batches, schema))
+}
+
+/// Resumable state for `running_total(n)`; each field survives between batches.
+///
+/// Deriving `Serialize`, `Deserialize` and VGI-RPC's `StreamState` is all the
+/// server needs to carry the state in continuation tokens.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, StreamState)]
+pub struct RunningTotal {
+    /// Number of rows to produce.
+    pub count: i64,
+    /// Next number to emit.
+    pub position: i64,
+    /// Sum of every number emitted so far.
+    pub total: i64,
+}
+
+impl RunningTotal {
+    /// Start a running total over 0..count-1.
+    pub fn new(count: i64) -> Self {
+        Self {
+            count,
+            position: 0,
+            total: 0,
+        }
+    }
+}
+
+impl ResultProducer for RunningTotal {
+    /// Emit the next batch and advance the state, or return `None` when done.
+    fn produce(&mut self) -> Result<Option<RecordBatch>> {
+        if self.position >= self.count {
+            return Ok(None);
+        }
+        let numbers = self.position..self.count.min(self.position + BATCH_ROWS);
+        let totals = numbers
+            .clone()
+            .map(|number| {
+                self.total += number;
+                self.total
+            })
+            .collect::<Vec<_>>();
+        self.position = numbers.end;
+        let batch = RecordBatch::try_new(
+            running_total_schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(numbers)),
+                Arc::new(Int64Array::from(totals)),
+            ],
+        )?;
+        Ok(Some(batch))
+    }
+}
+
+/// A recognized query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Query {
+    /// `SELECT 'Hello, world!' AS message`
+    Hello,
+    /// `SELECT * FROM numbers(n)`
+    Numbers(i64),
+    /// `SELECT * FROM running_total(n)`
+    RunningTotal(i64),
+}
+
+impl Query {
+    /// Recognize one of the supported queries (case-insensitive, surrounding
+    /// whitespace and one trailing semicolon allowed).
+    pub fn parse(sql: &str) -> Result<Self> {
+        let text = sql.trim();
+        let text = text.strip_suffix(';').unwrap_or(text).trim().to_lowercase();
+        if text == "select 'hello, world!' as message" {
+            return Ok(Self::Hello);
+        }
+        let call = text.strip_prefix("select * from ").unwrap_or_default();
+        let (function, argument) = call.split_once('(').unwrap_or_default();
+        let digits = argument.strip_suffix(')').unwrap_or_default();
+        let is_count =
+            (1..=6).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit());
+        let count = is_count
+            .then(|| digits.parse::<i64>().ok())
+            .flatten()
+            .filter(|count| *count <= MAX_ROWS);
+        match (function, count) {
+            ("numbers", Some(count)) => Ok(Self::Numbers(count)),
+            ("running_total", Some(count)) => Ok(Self::RunningTotal(count)),
+            _ => {
+                let mut error = Error::with_message_and_status(SUPPORTED, Status::InvalidArguments);
+                error.sqlstate = sqlstate(b"42000");
+                Err(error)
+            }
+        }
+    }
+
+    /// The Arrow schema of this query's result.
+    pub fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Hello => hello_schema(),
+            Self::Numbers(_) => numbers_schema(),
+            Self::RunningTotal(_) => running_total_schema(),
+        }
+    }
+
+    /// Start producing this query's result.
+    pub fn run(&self) -> Result<QueryResult> {
+        Ok(match *self {
+            Self::Hello => {
+                let batch = RecordBatch::try_new(
+                    hello_schema(),
+                    vec![Arc::new(StringArray::from(vec!["Hello, world!"]))],
+                )?;
+                QueryResult::from_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(batch)],
+                    hello_schema(),
+                )))
+            }
+            Self::Numbers(count) => QueryResult::from_reader(numbers(count)),
+            Self::RunningTotal(count) => {
+                QueryResult::from_producer(running_total_schema(), RunningTotal::new(count))
+            }
         })
     }
-
-    pub fn schema(self) -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("number", DataType::Int64, true),
-            Field::new("payload", DataType::Binary, true),
-        ]))
-    }
-
-    pub fn reader(self, counters: Arc<Counters>) -> SyntheticReader {
-        SyntheticReader {
-            workload: self,
-            schema: self.schema(),
-            position: 0,
-            counters,
-        }
-    }
 }
 
-/// Fixed-size aggregate counters; no request values or identifiers are retained.
-#[derive(Default)]
-pub struct Counters {
-    pub opened: AtomicUsize,
-    pub closed: AtomicUsize,
-    pub queries: AtomicUsize,
-    pub failures: AtomicUsize,
-    pub batches: AtomicUsize,
+fn sqlstate(code: &[u8; 5]) -> [std::ffi::c_char; 5] {
+    code.map(|byte| byte as std::ffi::c_char)
 }
 
-/// A cursor allocates exactly one batch when pulled, never an entire result.
-pub struct SyntheticReader {
-    workload: Workload,
-    schema: SchemaRef,
-    position: usize,
-    counters: Arc<Counters>,
+/// One ADBC statement: set a query, optionally prepare it, then execute it.
+///
+/// Every operation not implemented here (binding, updates, partitions and so
+/// on) returns ADBC `NOT_IMPLEMENTED` through the trait's defaults.
+#[derive(Debug, Default)]
+pub struct HelloStatement {
+    sql: Option<String>,
 }
 
-impl Iterator for SyntheticReader {
-    type Item = std::result::Result<RecordBatch, ArrowError>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position == self.workload.rows {
-            return None;
-        }
-        let end = (self.position + self.workload.batch_rows).min(self.workload.rows);
-        let numbers = Int64Array::from_iter_values((self.position..end).map(|n| n as i64));
-        let payload = vec![b'x'; self.workload.payload_bytes];
-        let values =
-            BinaryArray::from_iter_values((self.position..end).map(|_| payload.as_slice()));
-        self.position = end;
-        self.counters.batches.fetch_add(1, Ordering::Relaxed);
-        Some(RecordBatch::try_new(
-            self.schema.clone(),
-            vec![Arc::new(numbers), Arc::new(values)],
-        ))
-    }
-}
-impl RecordBatchReader for SyntheticReader {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+impl HelloStatement {
+    fn query(&self) -> Result<Query> {
+        let sql = self.sql.as_deref().ok_or_else(|| {
+            Error::with_message_and_status(
+                "Set a query before executing the statement",
+                Status::InvalidState,
+            )
+        })?;
+        Query::parse(sql)
     }
 }
 
-pub struct SyntheticBackend {
-    pub workload: Workload,
-    pub counters: Arc<Counters>,
+impl BackendStatement for HelloStatement {
+    /// Store the query text; it is validated when prepared or executed.
+    fn set_sql_query(&mut self, query: &str) -> Result<()> {
+        self.sql = Some(query.to_string());
+        Ok(())
+    }
+
+    /// Validate the query; clients such as DuckDB's `adbc_scanner` prepare
+    /// before executing.
+    fn prepare(&mut self) -> Result<()> {
+        self.query().map(drop)
+    }
+
+    /// The supported queries take no parameters.
+    fn get_parameter_schema(&self) -> Result<Schema> {
+        self.query()?;
+        Ok(Schema::empty())
+    }
+
+    /// The result schema, without producing rows.
+    fn execute_schema(&mut self) -> Result<Schema> {
+        Ok(self.query()?.schema().as_ref().clone())
+    }
+
+    /// Execute the query.
+    fn execute_result(&mut self) -> Result<QueryResult> {
+        self.query()?.run()
+    }
 }
 
-impl Backend for SyntheticBackend {
+/// A client connection; each statement is independent.
+#[derive(Debug, Default)]
+pub struct HelloConnection;
+
+impl BackendConnection for HelloConnection {
+    fn new_statement(&mut self) -> Result<Box<dyn BackendStatement>> {
+        Ok(Box::new(HelloStatement::default()))
+    }
+}
+
+/// Serve the `hello` target; each client connection gets its own
+/// [`HelloConnection`].
+#[derive(Debug, Default)]
+pub struct HelloBackend;
+
+impl Backend for HelloBackend {
     fn open(
         &self,
-        target: &TargetConfig,
+        _target: &TargetConfig,
         database_options: Vec<(String, OptionValue)>,
         connection_options: Vec<(String, OptionValue)>,
     ) -> Result<Box<dyn BackendConnection>> {
-        if !database_options.is_empty()
-            || !target.database_options.is_empty()
-            || !target.connection_options.is_empty()
-        {
-            return unsupported();
+        if !database_options.is_empty() || !connection_options.is_empty() {
+            return Err(Error::with_message_and_status(
+                "The hello-world service accepts no database or connection options",
+                Status::NotImplemented,
+            ));
         }
-        let mut connection = SyntheticConnection {
-            workload: self.workload,
-            counters: self.counters.clone(),
-            counted: false,
-        };
-        for (key, value) in connection_options {
-            connection.set_option(&key, value)?;
-        }
-        connection.counted = true;
-        self.counters.opened.fetch_add(1, Ordering::Relaxed);
-        Ok(Box::new(connection))
-    }
-}
-struct SyntheticConnection {
-    workload: Workload,
-    counters: Arc<Counters>,
-    counted: bool,
-}
-impl Drop for SyntheticConnection {
-    fn drop(&mut self) {
-        if self.counted {
-            self.counters.closed.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-struct SyntheticStatement {
-    workload: Workload,
-    counters: Arc<Counters>,
-    command: Command,
-}
-#[derive(Clone, Copy)]
-enum Command {
-    Unset,
-    Query,
-    Fail,
-    Unknown,
-}
-struct UnsupportedCancel;
-impl CancelHandle for UnsupportedCancel {
-    fn try_cancel(&self) -> Result<()> {
-        unsupported()
-    }
-}
-
-fn error(message: &str, status: Status) -> Error {
-    Error::with_message_and_status(message, status)
-}
-fn unsupported<T>() -> Result<T> {
-    Err(error(
-        "Synthetic worker does not implement this operation",
-        Status::NotImplemented,
-    ))
-}
-
-impl BackendConnection for SyntheticConnection {
-    fn new_statement(&mut self) -> Result<Box<dyn BackendStatement>> {
-        Ok(Box::new(SyntheticStatement {
-            workload: self.workload,
-            counters: self.counters.clone(),
-            command: Command::Unset,
-        }))
-    }
-    fn set_option(&mut self, key: &str, value: OptionValue) -> Result<()> {
-        if key == "adbc.connection.autocommit"
-            && matches!(value, OptionValue::String(v) if v == "true")
-        {
-            Ok(())
-        } else {
-            unsupported()
-        }
-    }
-    fn get_option_string(&self, key: &str) -> Result<String> {
-        if key == "adbc.connection.autocommit" {
-            Ok("true".into())
-        } else {
-            unsupported()
-        }
-    }
-
-    fn get_option_bytes(&self, _key: &str) -> Result<Vec<u8>> {
-        unsupported()
-    }
-    fn get_option_int(&self, _key: &str) -> Result<i64> {
-        unsupported()
-    }
-    fn get_option_double(&self, _key: &str) -> Result<f64> {
-        unsupported()
-    }
-    fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
-        Arc::new(UnsupportedCancel)
-    }
-
-    fn get_info(&self, _codes: Option<HashSet<InfoCode>>) -> Result<Reader> {
-        unsupported()
-    }
-    fn get_objects(
-        &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
-    ) -> Result<Reader> {
-        unsupported()
-    }
-    fn get_table_schema(
-        &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
-    ) -> Result<Schema> {
-        unsupported()
-    }
-    fn get_table_types(&self) -> Result<Reader> {
-        unsupported()
-    }
-    fn get_statistic_names(&self) -> Result<Reader> {
-        unsupported()
-    }
-    fn get_statistics(
-        &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _approximate: bool,
-    ) -> Result<Reader> {
-        unsupported()
-    }
-    fn commit(&mut self) -> Result<()> {
-        unsupported()
-    }
-    fn rollback(&mut self) -> Result<()> {
-        unsupported()
-    }
-    fn read_partition(&self, _partition: &[u8]) -> Result<Reader> {
-        unsupported()
-    }
-}
-
-impl BackendStatement for SyntheticStatement {
-    fn set_option(&mut self, _key: &str, _value: OptionValue) -> Result<()> {
-        unsupported()
-    }
-    fn get_option_string(&self, _key: &str) -> Result<String> {
-        unsupported()
-    }
-
-    fn get_option_bytes(&self, _key: &str) -> Result<Vec<u8>> {
-        unsupported()
-    }
-    fn get_option_int(&self, _key: &str) -> Result<i64> {
-        unsupported()
-    }
-    fn get_option_double(&self, _key: &str) -> Result<f64> {
-        unsupported()
-    }
-    fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
-        Arc::new(UnsupportedCancel)
-    }
-
-    fn bind(&mut self, _batch: RecordBatch) -> Result<()> {
-        unsupported()
-    }
-    fn bind_stream(&mut self, _reader: Reader) -> Result<()> {
-        unsupported()
-    }
-    fn set_sql_query(&mut self, query: &str) -> Result<()> {
-        if query.len() > 64 * 1024 {
-            return Err(error("Query exceeds byte limit", Status::InvalidArguments));
-        }
-        self.command = match query {
-            "QUERY" => Command::Query,
-            "FAIL" => Command::Fail,
-            _ => Command::Unknown,
-        };
-        Ok(())
-    }
-    fn set_substrait_plan(&mut self, _plan: &[u8]) -> Result<()> {
-        unsupported()
-    }
-    fn prepare(&mut self) -> Result<()> {
-        unsupported()
-    }
-    fn execute(&mut self) -> Result<Reader> {
-        match self.command {
-            Command::Query => {
-                self.counters.queries.fetch_add(1, Ordering::Relaxed);
-                Ok(Box::new(self.workload.reader(self.counters.clone())))
-            }
-            Command::Fail => {
-                self.counters.failures.fetch_add(1, Ordering::Relaxed);
-                let mut error = error("Injected workload error", Status::InvalidData);
-                error.sqlstate = [50, 50, 48, 48, 48];
-                Err(error)
-            }
-            Command::Unset => Err(error("Set a query before execution", Status::InvalidState)),
-            Command::Unknown => Err(error("Unknown workload command", Status::InvalidArguments)),
-        }
-    }
-    fn execute_update(&mut self) -> Result<Option<i64>> {
-        unsupported()
-    }
-    fn execute_schema(&mut self) -> Result<Schema> {
-        unsupported()
-    }
-    fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        unsupported()
-    }
-    fn get_parameter_schema(&self) -> Result<Schema> {
-        unsupported()
+        Ok(Box::new(HelloConnection))
     }
 }
