@@ -20,10 +20,10 @@ adbc_core = { git = "https://github.com/apache/arrow-adbc.git", rev = "c942d481c
 arrow-array = "60"
 arrow-schema = "60"
 # CI builds the native ADBC driver from this same grainlift revision.
-grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "50f84f4e55de43ce70f0303a914cb582a262b2a2" }
+grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "357b426b0a4eb0790a18ae2c96f5df72cf50f768" }
 serde = { version = "1", features = ["derive"] }
 # StreamState (serializable producer state) comes from VGI-RPC.
-vgi-rpc = { version = "0.28.0", default-features = false, features = ["macros", "stream-codec"] }
+vgi-rpc = { version = "0.28.2", default-features = false, features = ["macros", "stream-codec"] }
 
 [dev-dependencies]
 adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc.git", rev = "c942d481c6e083040c68676e3dd454dad89503e9" }

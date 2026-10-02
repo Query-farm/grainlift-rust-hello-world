@@ -135,6 +135,11 @@ served with `grainlift_server::dev::Service::serve_http`.
 - `--host mtls`: verified TCP/mTLS; client certificates identify callers.
 - `--port`: listening port (default 8080). Point the client at a different
   port with `GRAINLIFT_ENDPOINT`.
+- `--storage-endpoint` and `--storage-bucket` (with `--storage-region` and
+  `--storage-prefix`): send large HTTP requests and results through an
+  S3-compatible bucket (S3, R2, MinIO), with credentials from
+  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Clients get presigned URLs;
+  see Grainlift's README.
 
 For mTLS, supply the server chain, key, client CA and the authorized client's
 SPIFFE ID (its certificate URI SAN):
